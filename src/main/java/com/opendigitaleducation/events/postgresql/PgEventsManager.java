@@ -4,6 +4,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -48,7 +49,7 @@ public class PgEventsManager {
                             final Transaction tx = res.result();
                             final List<Future> f = new ArrayList<>();
                             for (Object o : schemas) {
-                                f.add(createTableIfNotExists(existsTables, tx, (JsonObject) o));
+                                createTableIfNotExists(existsTables, tx, (JsonObject) o).ifPresent(f::add);
                             }
                             CompositeFuture.all(f).onComplete(ar2 -> {
                                 if (ar2.succeeded()) {
@@ -70,7 +71,7 @@ public class PgEventsManager {
         });
     }
 
-    private Future<Void> createTableIfNotExists(Set<String> existsTables, Transaction tx, JsonObject schema) {
+    private Optional<Future<Void>> createTableIfNotExists(Set<String> existsTables, Transaction tx, JsonObject schema) {
         Promise<Void> promise = Promise.promise();
         final String tableName = schema.getString("table");
         if (!existsTables.contains(tableName)) {
@@ -123,8 +124,10 @@ public class PgEventsManager {
                     }
                 });
             }
+            return Optional.of(promise.future());
+        } else {
+            return Optional.empty();
         }
-        return promise.future();
     }
 
     private Future<Void> createPartitionOfTable(Transaction tx, String tableName, LocalDateTime date) {
