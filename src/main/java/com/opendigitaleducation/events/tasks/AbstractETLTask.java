@@ -44,6 +44,9 @@ public abstract class AbstractETLTask implements Task {
     protected abstract void transform(RowSet<Row> rows, Handler<AsyncResult<List<Tuple>>> handler);
 
     protected void load(List<Tuple> tuples, Handler<AsyncResult<Void>> handler) {
+        if (tuples.isEmpty()) {
+            handler.handle(Future.succeededFuture());
+        }
         masterPgPool.preparedQuery(loadQuery()).executeBatch(tuples, ar -> {
             if (ar.succeeded()) {
                 handler.handle(Future.succeededFuture());
