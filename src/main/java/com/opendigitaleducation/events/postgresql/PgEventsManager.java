@@ -1,12 +1,14 @@
 package com.opendigitaleducation.events.postgresql;
 
 import java.time.LocalDateTime;
+import java.time.temporal.WeekFields;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
 import io.vertx.core.AsyncResult;
@@ -24,8 +26,11 @@ import io.vertx.sqlclient.Transaction;
 
 public class PgEventsManager {
 
+    public enum RangeInterval { WEEK, MONTH }
+
     private static final Logger log = LoggerFactory.getLogger(PgEventsManager.class);
     private final PgPool masterPgPool;
+
 
     public PgEventsManager(PgPool mastPgPool) {
         this.masterPgPool = mastPgPool;
@@ -50,6 +55,89 @@ public class PgEventsManager {
                             final List<Future> f = new ArrayList<>();
                             for (Object o : schemas) {
                                 createTableIfNotExists(existsTables, tx, (JsonObject) o).ifPresent(f::add);
+                            }
+                            CompositeFuture.all(f).onComplete(ar2 -> {
+                                if (ar2.succeeded()) {
+                                    tx.commit(handler);
+                                } else {
+                                    tx.rollback(handler);
+                                }
+                            });
+                        } else {
+                            handler.handle(Future.failedFuture(res.cause()));
+                        }
+                    });
+                } else {
+                    handler.handle(Future.succeededFuture());
+                }
+            } else {
+                handler.handle(Future.failedFuture(ar.cause()));
+            }
+        });
+    }
+
+    public void addPartitionsInEventsTables(LocalDateTime startRange, LocalDateTime endRange, RangeInterval rangeInterval,
+            Handler<AsyncResult<Void>> handler) {
+
+        final Collector<Row, ?, List<PartitionTable>> collector = Collectors.mapping(
+            row -> new PartitionTable("events." + row.getString("parent_relname"),
+                    row.getString("child_schema") + "." + row.getString("child_relname"),
+                    startRange, endRange,
+                    LocalDateTime.parse(row.getString("partition_expression").split("'\\)\\s*TO\\s*\\('")[1].replace("')", "").replace(" ", "T"))),
+            Collectors.toList());
+        final String query =
+            "WITH events_tables as ( " +
+                "SELECT parent.relname AS parent_relname, nmsp_child.nspname  AS child_schema, " +
+                "child.relname AS child_relname, pg_get_expr(child.relpartbound, child.oid, true) as partition_expression, " +
+                "rank() OVER (PARTITION BY parent.relname ORDER BY child.relname DESC) as r " +
+                "FROM pg_inherits " +
+                "JOIN pg_class parent            ON pg_inherits.inhparent = parent.oid " +
+                "JOIN pg_class child             ON pg_inherits.inhrelid   = child.oid " +
+                "JOIN pg_namespace nmsp_parent   ON nmsp_parent.oid  = parent.relnamespace " +
+                "JOIN pg_namespace nmsp_child    ON nmsp_child.oid   = child.relnamespace " +
+                "WHERE nmsp_parent.nspname = 'events' " +
+            ") " +
+            "SELECT parent_relname, child_schema, child_relname, partition_expression " +
+            "FROM events_tables " +
+            "where events_tables.r = 1 " +
+            "ORDER BY parent_relname ";
+        masterPgPool.query(query).collecting(collector).execute(ar -> {
+            if (ar.succeeded()) {
+                final List<PartitionTable> partitions = ar.result().value().stream()
+                        .filter(x -> x.getDbEndRange().isBefore(endRange))
+                        .collect(Collectors.toList());
+                if (!partitions.isEmpty()) {
+                    final boolean isWeekRange = RangeInterval.WEEK == rangeInterval;
+                    masterPgPool.begin(res -> {
+                        if (res.succeeded()) {
+                            final Transaction tx = res.result();
+                            final List<Future> f = new ArrayList<>();
+                            for (PartitionTable partitionTable: partitions) {
+                                LocalDateTime date;
+                                if (startRange.isBefore(partitionTable.getDbEndRange())) {
+                                    date = partitionTable.getDbEndRange();
+                                } else {
+                                    date = startRange;
+                                }
+                                if (isWeekRange) {
+                                    final WeekFields weekFields = WeekFields.ISO;
+                                    if (date.get(weekFields.dayOfWeek()) != 1) {
+                                        final LocalDateTime nextDate = date.plusWeeks(1).with(weekFields.dayOfWeek(), 1);
+                                        f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, true, nextDate));
+                                        date = nextDate;
+                                    }
+                                } else {
+                                    if (date.getDayOfMonth() != 1) {
+                                        final LocalDateTime nextDate = date.plusMonths(1).withDayOfMonth(1);
+                                        f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, false, nextDate));
+                                        date = nextDate;
+                                    }
+                                }
+
+                                while (date.isBefore(endRange)) {
+                                    f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, isWeekRange, null));
+                                    date = isWeekRange ? date.plusWeeks(1) : date.plusMonths(1);
+                                }
                             }
                             CompositeFuture.all(f).onComplete(ar2 -> {
                                 if (ar2.succeeded()) {
@@ -131,12 +219,25 @@ public class PgEventsManager {
     }
 
     private Future<Void> createPartitionOfTable(Transaction tx, String tableName, LocalDateTime date) {
+        return createPartitionOfTable(tx, tableName, date, false, null);
+    }
+
+    private Future<Void> createPartitionOfTable(Transaction tx, String tableName, LocalDateTime date, boolean partitionByWeek, LocalDateTime endDateTime) {
         final Promise<Void> promise = Promise.promise();
         final StringBuilder sb = new StringBuilder();
-        final String subtableName = tableName + date.getYear() + String.format("%1$2s", date.getMonthValue()).replace(' ', '0');
+        final String subtableName;
+        final LocalDateTime excludeLimitDateTime;
+        if (partitionByWeek) {
+            WeekFields weekFields = WeekFields.ISO;
+            subtableName = tableName + date.getYear() + String.format("%1$2s", date.get(weekFields.weekOfWeekBasedYear())).replace(' ', '0');
+            excludeLimitDateTime = endDateTime != null ? endDateTime : date.plusWeeks(1);
+        } else {
+            subtableName = tableName + date.getYear() + String.format("%1$2s", date.getMonthValue()).replace(' ', '0');
+            excludeLimitDateTime = endDateTime != null ? endDateTime : date.plusMonths(1);
+        }
         sb.append("CREATE TABLE ").append(subtableName)
                 .append(" PARTITION OF ").append(tableName).append(" FOR VALUES FROM ('").append(date.toString())
-                .append("') TO ('").append(date.plusMonths(1).toString()).append("');");
+                .append("') TO ('").append(excludeLimitDateTime.toString()).append("');");
         tx.query(sb.toString()).execute(ar -> {
             if (ar.succeeded()) {
                 final StringBuilder sb2 = new StringBuilder();
