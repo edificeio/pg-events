@@ -82,8 +82,7 @@ public class PgEventsManager {
         final Collector<Row, ?, List<PartitionTable>> collector = Collectors.mapping(
             row -> new PartitionTable("events." + row.getString("parent_relname"),
                     row.getString("child_schema") + "." + row.getString("child_relname"),
-                    startRange, endRange,
-                    LocalDateTime.parse(row.getString("partition_expression").split("'\\)\\s*TO\\s*\\('")[1].replace("')", "").replace(" ", "T"))),
+                    row.getString("partition_expression")),
             Collectors.toList());
         final String query =
             "WITH events_tables as ( " +
@@ -139,6 +138,50 @@ public class PgEventsManager {
                                     date = isWeekRange ? date.plusWeeks(1) : date.plusMonths(1);
                                 }
                             }
+                            CompositeFuture.all(f).onComplete(ar2 -> {
+                                if (ar2.succeeded()) {
+                                    tx.commit(handler);
+                                } else {
+                                    tx.rollback(handler);
+                                }
+                            });
+                        } else {
+                            handler.handle(Future.failedFuture(res.cause()));
+                        }
+                    });
+                } else {
+                    handler.handle(Future.succeededFuture());
+                }
+            } else {
+                handler.handle(Future.failedFuture(ar.cause()));
+            }
+        });
+    }
+
+    public void dropOldEmptyPartitionsEventsTables(LocalDateTime dropBeforeDate, Handler<AsyncResult<Void>> handler) {
+        final Collector<Row, ?, List<PartitionTable>> collector = Collectors.mapping(
+            row -> new PartitionTable(null,
+                    row.getString("child_schema") + "." + row.getString("child_relname"),
+                    row.getString("partition_expression")),
+            Collectors.toList());
+        final String query =
+                "SELECT nmsp_child.nspname AS child_schema, child.relname AS child_relname, " +
+                "pg_get_expr(child.relpartbound, child.oid, true) as partition_expression " +
+                "FROM pg_inherits " +
+                "JOIN pg_class child ON pg_inherits.inhrelid = child.oid " +
+                "JOIN pg_namespace nmsp_child ON nmsp_child.oid = child.relnamespace " +
+                "WHERE nmsp_child.nspname = 'events' and child.reltuples = 0 ";
+        masterPgPool.query(query).collecting(collector).execute(ar -> {
+            if (ar.succeeded()) {
+                final List<PartitionTable> partitions = ar.result().value().stream()
+                        .filter(x -> x.getDbEndRange().isBefore(dropBeforeDate))
+                        .collect(Collectors.toList());
+                if (!partitions.isEmpty()) {
+                    masterPgPool.begin(res -> {
+                        if (res.succeeded()) {
+                            final Transaction tx = res.result();
+                            final List<Future> f = new ArrayList<>();
+                            partitions.forEach(p -> f.add(p.removePartition(masterPgPool, tx)));
                             CompositeFuture.all(f).onComplete(ar2 -> {
                                 if (ar2.succeeded()) {
                                     tx.commit(handler);
