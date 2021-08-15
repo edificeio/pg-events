@@ -10,6 +10,7 @@ import java.util.Scanner;
 import java.util.Set;
 import java.util.stream.Collector;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import io.vertx.core.AsyncResult;
 import io.vertx.core.CompositeFuture;
@@ -23,6 +24,7 @@ import io.vertx.core.logging.LoggerFactory;
 import io.vertx.pgclient.PgPool;
 import io.vertx.sqlclient.Row;
 import io.vertx.sqlclient.Transaction;
+import io.vertx.sqlclient.Tuple;
 
 public class PgEventsManager {
 
@@ -76,31 +78,39 @@ public class PgEventsManager {
         });
     }
 
-    public void addPartitionsInEventsTables(LocalDateTime startRange, LocalDateTime endRange, RangeInterval rangeInterval,
+    public void addPartitionsTables(List<String> allowedSchemas, LocalDateTime startRange, LocalDateTime endRange, RangeInterval rangeInterval,
             Handler<AsyncResult<Void>> handler) {
-
+        if (allowedSchemas == null || allowedSchemas.isEmpty()) {
+            handler.handle(Future.failedFuture("Missing schema list"));
+            return;
+        }
         final Collector<Row, ?, List<PartitionTable>> collector = Collectors.mapping(
-            row -> new PartitionTable("events." + row.getString("parent_relname"),
+            row -> new PartitionTable(
+                    row.getString("parent_schema") +"." + row.getString("parent_relname"),
                     row.getString("child_schema") + "." + row.getString("child_relname"),
                     row.getString("partition_expression")),
             Collectors.toList());
         final String query =
             "WITH events_tables as ( " +
-                "SELECT parent.relname AS parent_relname, nmsp_child.nspname  AS child_schema, " +
-                "child.relname AS child_relname, pg_get_expr(child.relpartbound, child.oid, true) as partition_expression, " +
+                "SELECT nmsp_parent.nspname  AS parent_schema, parent.relname AS parent_relname, " +
+                "nmsp_child.nspname  AS child_schema, child.relname AS child_relname, " +
+                "pg_get_expr(child.relpartbound, child.oid, true) as partition_expression, " +
                 "rank() OVER (PARTITION BY parent.relname ORDER BY child.relname DESC) as r " +
                 "FROM pg_inherits " +
                 "JOIN pg_class parent            ON pg_inherits.inhparent = parent.oid " +
                 "JOIN pg_class child             ON pg_inherits.inhrelid   = child.oid " +
                 "JOIN pg_namespace nmsp_parent   ON nmsp_parent.oid  = parent.relnamespace " +
                 "JOIN pg_namespace nmsp_child    ON nmsp_child.oid   = child.relnamespace " +
-                "WHERE nmsp_parent.nspname = 'events' " +
+                "WHERE nmsp_parent.nspname IN " + IntStream
+                .rangeClosed(1, allowedSchemas.size()).boxed().map(i -> "$" + i).collect(Collectors.joining(",", "(", ")")) +
             ") " +
-            "SELECT parent_relname, child_schema, child_relname, partition_expression " +
+            "SELECT parent_schema, parent_relname, child_schema, child_relname, partition_expression " +
             "FROM events_tables " +
             "where events_tables.r = 1 " +
             "ORDER BY parent_relname ";
-        masterPgPool.query(query).collecting(collector).execute(ar -> {
+        final Tuple t = Tuple.tuple();
+        allowedSchemas.stream().forEach(t::addString);
+        masterPgPool.preparedQuery(query).collecting(collector).execute(t, ar -> {
             if (ar.succeeded()) {
                 final List<PartitionTable> partitions = ar.result().value().stream()
                         .filter(x -> x.getDbEndRange().isBefore(endRange))
@@ -158,7 +168,12 @@ public class PgEventsManager {
         });
     }
 
-    public void dropOldEmptyPartitionsEventsTables(LocalDateTime dropBeforeDate, Handler<AsyncResult<Void>> handler) {
+    public void dropOldEmptyPartitionsTables(List<String> allowedSchemas, LocalDateTime dropBeforeDate, Handler<AsyncResult<Void>> handler) {
+        if (allowedSchemas == null || allowedSchemas.isEmpty()) {
+            handler.handle(Future.failedFuture("Missing schema list"));
+            return;
+        }
+
         final Collector<Row, ?, List<PartitionTable>> collector = Collectors.mapping(
             row -> new PartitionTable(null,
                     row.getString("child_schema") + "." + row.getString("child_relname"),
@@ -170,8 +185,12 @@ public class PgEventsManager {
                 "FROM pg_inherits " +
                 "JOIN pg_class child ON pg_inherits.inhrelid = child.oid " +
                 "JOIN pg_namespace nmsp_child ON nmsp_child.oid = child.relnamespace " +
-                "WHERE nmsp_child.nspname = 'events' and child.reltuples = 0 ";
-        masterPgPool.query(query).collecting(collector).execute(ar -> {
+                "WHERE nmsp_child.nspname IN " + IntStream
+                        .rangeClosed(1, allowedSchemas.size()).boxed().map(i -> "$" + i).collect(Collectors.joining(",", "(", ")")) +
+                " and child.reltuples = 0 ";
+        final Tuple t = Tuple.tuple();
+        allowedSchemas.stream().forEach(t::addString);
+        masterPgPool.preparedQuery(query).collecting(collector).execute(t, ar -> {
             if (ar.succeeded()) {
                 final List<PartitionTable> partitions = ar.result().value().stream()
                         .filter(x -> x.getDbEndRange().isBefore(dropBeforeDate))
