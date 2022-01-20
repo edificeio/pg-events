@@ -106,7 +106,7 @@ public class PgEventsManager {
             ") " +
             "SELECT parent_schema, parent_relname, child_schema, child_relname, partition_expression " +
             "FROM events_tables " +
-            "where events_tables.r = 1 " +
+            "where events_tables.r = 1 and partition_expression is not null " +
             "ORDER BY parent_relname ";
         final Tuple t = Tuple.tuple();
         allowedSchemas.stream().forEach(t::addString);
@@ -187,7 +187,7 @@ public class PgEventsManager {
                 "JOIN pg_namespace nmsp_child ON nmsp_child.oid = child.relnamespace " +
                 "WHERE nmsp_child.nspname IN " + IntStream
                         .rangeClosed(1, allowedSchemas.size()).boxed().map(i -> "$" + i).collect(Collectors.joining(",", "(", ")")) +
-                " and child.reltuples = 0 ";
+                " and child.reltuples = 0 and pg_get_expr(child.relpartbound, child.oid, true) is not null ";
         final Tuple t = Tuple.tuple();
         allowedSchemas.stream().forEach(t::addString);
         masterPgPool.preparedQuery(query).collecting(collector).execute(t, ar -> {
