@@ -291,7 +291,11 @@ public class PgEventsManager {
         final LocalDateTime excludeLimitDateTime;
         if (partitionByWeek) {
             WeekFields weekFields = WeekFields.ISO;
-            subtableName = tableName + date.getYear() + String.format("%1$2s", date.get(weekFields.weekOfWeekBasedYear())).replace(' ', '0');
+            int year = date.getYear();
+            if (date.getMonthValue() == 12 && date.get(weekFields.weekOfWeekBasedYear()) == 1) {
+                year++;
+            }
+            subtableName = tableName + year + String.format("%1$2s", date.get(weekFields.weekOfWeekBasedYear())).replace(' ', '0');
             excludeLimitDateTime = endDateTime != null ? endDateTime : date.plusWeeks(1);
         } else {
             subtableName = tableName + date.getYear() + String.format("%1$2s", date.getMonthValue()).replace(' ', '0');

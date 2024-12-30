@@ -20,7 +20,7 @@
 
   <groupId>com.opendigitaleducation</groupId>
   <artifactId>pg-events</artifactId>
-  <version>1.2.1</version>
+  <version>1.2.2</version>
 
   <name>pg-events</name>
   <description>A common artifact to manage events.</description>
