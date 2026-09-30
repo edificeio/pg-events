@@ -117,46 +117,23 @@ public class PgEventsManager {
                         .collect(Collectors.toList());
                 if (!partitions.isEmpty()) {
                     final boolean isWeekRange = RangeInterval.WEEK == rangeInterval;
-                    masterPgPool.begin(res -> {
-                        if (res.succeeded()) {
-                            final Transaction tx = res.result();
-                            final List<Future> f = new ArrayList<>();
-                            for (PartitionTable partitionTable: partitions) {
-                                LocalDateTime date;
-                                if (startRange.isBefore(partitionTable.getDbEndRange())) {
-                                    date = partitionTable.getDbEndRange();
-                                } else {
-                                    date = startRange;
-                                }
-                                if (isWeekRange) {
-                                    final WeekFields weekFields = WeekFields.ISO;
-                                    if (date.get(weekFields.dayOfWeek()) != 1) {
-                                        final LocalDateTime nextDate = date.plusWeeks(1).with(weekFields.dayOfWeek(), 1);
-                                        f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, true, nextDate));
-                                        date = nextDate;
-                                    }
-                                } else {
-                                    if (date.getDayOfMonth() != 1) {
-                                        final LocalDateTime nextDate = date.plusMonths(1).withDayOfMonth(1);
-                                        f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, false, nextDate));
-                                        date = nextDate;
-                                    }
-                                }
-
-                                while (date.isBefore(endRange)) {
-                                    f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, isWeekRange, null));
-                                    date = isWeekRange ? date.plusWeeks(1) : date.plusMonths(1);
-                                }
-                            }
-                            CompositeFuture.all(f).onComplete(ar2 -> {
-                                if (ar2.succeeded()) {
-                                    tx.commit(handler);
-                                } else {
-                                    tx.rollback(handler);
-                                }
-                            });
+                    // one transaction per parent table to avoid holding ACCESS EXCLUSIVE locks
+                    // on several parent tables at the same time (deadlock with concurrent queries)
+                    final List<String> failedTables = new ArrayList<>();
+                    Future<Void> chain = Future.succeededFuture();
+                    for (PartitionTable partitionTable: partitions) {
+                        chain = chain.compose(v -> addPartitionsOfTable(partitionTable, startRange, endRange, isWeekRange)
+                                .otherwise(err -> {
+                                    log.error("Error creating partitions of table : " + partitionTable.getParentTableName(), err);
+                                    failedTables.add(partitionTable.getParentTableName());
+                                    return null;
+                                }));
+                    }
+                    chain.onComplete(ar2 -> {
+                        if (failedTables.isEmpty()) {
+                            handler.handle(Future.succeededFuture());
                         } else {
-                            handler.handle(Future.failedFuture(res.cause()));
+                            handler.handle(Future.failedFuture("Error creating partitions of tables : " + failedTables));
                         }
                     });
                 } else {
@@ -166,6 +143,52 @@ public class PgEventsManager {
                 handler.handle(Future.failedFuture(ar.cause()));
             }
         });
+    }
+
+    private Future<Void> addPartitionsOfTable(PartitionTable partitionTable, LocalDateTime startRange, LocalDateTime endRange,
+            boolean isWeekRange) {
+        final Promise<Void> promise = Promise.promise();
+        masterPgPool.begin(res -> {
+            if (res.succeeded()) {
+                final Transaction tx = res.result();
+                final List<Future> f = new ArrayList<>();
+                LocalDateTime date;
+                if (startRange.isBefore(partitionTable.getDbEndRange())) {
+                    date = partitionTable.getDbEndRange();
+                } else {
+                    date = startRange;
+                }
+                if (isWeekRange) {
+                    final WeekFields weekFields = WeekFields.ISO;
+                    if (date.get(weekFields.dayOfWeek()) != 1) {
+                        final LocalDateTime nextDate = date.plusWeeks(1).with(weekFields.dayOfWeek(), 1);
+                        f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, true, nextDate));
+                        date = nextDate;
+                    }
+                } else {
+                    if (date.getDayOfMonth() != 1) {
+                        final LocalDateTime nextDate = date.plusMonths(1).withDayOfMonth(1);
+                        f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, false, nextDate));
+                        date = nextDate;
+                    }
+                }
+
+                while (date.isBefore(endRange)) {
+                    f.add(createPartitionOfTable(tx, partitionTable.getParentTableName(), date, isWeekRange, null));
+                    date = isWeekRange ? date.plusWeeks(1) : date.plusMonths(1);
+                }
+                CompositeFuture.all(f).onComplete(ar -> {
+                    if (ar.succeeded()) {
+                        tx.commit(promise);
+                    } else {
+                        tx.rollback(ar2 -> promise.fail(ar.cause()));
+                    }
+                });
+            } else {
+                promise.fail(res.cause());
+            }
+        });
+        return promise.future();
     }
 
     public void dropOldEmptyPartitionsTables(List<String> allowedSchemas, LocalDateTime dropBeforeDate, Handler<AsyncResult<Void>> handler) {
